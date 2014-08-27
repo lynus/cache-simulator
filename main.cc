@@ -1,6 +1,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <fstream>
 #include <list>
 #include <math.h>
 #include <memory>
@@ -8,17 +9,83 @@
 #include <map>
 #include <boost/optional.hpp>
 #include <boost/intrusive/list.hpp>
-#include <sequence.h>
+#include "sequence.h"
 
 #include <stdlib.h>
+#include <time.h>
 
+#include "rule.hpp"
 using namespace std;
 using namespace boost;
+using namespace boost::archive;
+#define ASSIGN(arr,index,d1,d2,d3,d4)	arr[index][0] = d1;	\
+					arr[index][1] = d2;	\
+					arr[index][2] = d3;	\
+					arr[index][3] = d4;	
+
+#define C40(array)	ASSIGN(array, 0, 0,0,0,0);
+#define C41(array)	ASSIGN(array, 0, 1,0,0,0);	\
+			ASSIGN(array, 1, 0,1,0,0);	\
+			ASSIGN(array, 2, 0,0,1,0);	\
+			ASSIGN(array, 3, 0,0,0,1);
+
+#define C42(array)	ASSIGN(array, 0, 1,1,0,0);	\
+			ASSIGN(array, 1, 1,0,1,0);	\
+			ASSIGN(array, 2, 1,0,0,1);	\
+			ASSIGN(array, 3, 0,1,1,0);	\
+			ASSIGN(array, 4, 0,1,0,1);	\
+			ASSIGN(array, 5, 0,0,1,1);
+
+#define C43(array)	ASSIGN(array, 0, 1,1,1,0);	\
+			ASSIGN(array, 1, 1,1,0,1);	\
+			ASSIGN(array, 2, 1,0,1,1);	\
+			ASSIGN(array, 3, 0,1,1,1);
+
+#define C44(array)	ASSIGN(array, 0, 1,1,1,1);
+			
 
 //----------------------------------------------------------------
 
 namespace {
-	typedef unsigned block;
+	typedef bnr_t	block;
+	class prefetch_map;
+	void mk_candidate(vector<seq> &candi, seq &ante, int i)
+	{
+		static int times[] = {1, 4, 6, 4, 1};
+		int index[6][4];
+		candi.clear();
+		switch (i) {
+			case 0:
+				C40(index);
+				break;
+			case 1:
+				C41(index);
+				break;
+			case 2:
+				C42(index);
+				break;
+			case 3:
+				C43(index);
+				break;
+			case 4:
+				C44(index);
+				break;
+		}
+		for(int j = 0; j < times[i]; j++) {
+			int ii;
+			ii = 0;
+			seq t;
+			for (auto it = ante.begin(); it != ante.end(); it++) {
+				if (index[j][ii]) 
+					t.push_back(*it);
+				ii++;
+			}
+			t.push_back(ante.back());
+			t.sort();
+			candi.push_back(t);
+			t.clear();
+		}
+	}
 
 	//--------------------------------
 
@@ -29,6 +96,7 @@ namespace {
 	}
 
 	block rand_block(block max) {
+
 		return rand() % max;
 	}
 
@@ -55,7 +123,7 @@ namespace {
 	// probability density function
 	class pdf {
 	public:
-		typedef shared_ptr<pdf> ptr;
+		typedef std::shared_ptr<pdf> ptr;
 
 		virtual ~pdf() {}
 		virtual void generate(vector<double> &pdfs) const = 0;
@@ -75,7 +143,7 @@ namespace {
 
 	class gaussian : public pdf {
 	public:
-		typedef shared_ptr<gaussian> ptr;
+		typedef std::shared_ptr<gaussian> ptr;
 
 		gaussian(double mean, double variance)
 			: mean_(mean),
@@ -103,7 +171,7 @@ namespace {
 
 	class mixture : public pdf {
 	public:
-		typedef shared_ptr<mixture> ptr;
+		typedef std::shared_ptr<mixture> ptr;
 
 		void add_component(double weight, pdf::ptr pdf) {
 			components_.push_back(make_pair(weight, pdf));
@@ -149,7 +217,7 @@ namespace {
 
 	class cache {
 	public:
-		typedef shared_ptr<cache> ptr;
+		typedef std::shared_ptr<cache> ptr;
 
 		cache(unsigned size)
 			: hits_(0),
@@ -162,11 +230,17 @@ namespace {
 			return cache_size_;
 		}
 
-		void request(block origin_block) {
-			if (to_cache_.count(origin_block) > 0)
-				hits_++;
-			else
-				misses_++;
+		int request(block origin_block, bool prefetch = false) {
+			if (to_cache_.count(origin_block) > 0) {
+				if (!prefetch)
+					hits_++;
+				return 1;
+			}
+			else {
+				if (!prefetch)
+					misses_++;
+				return 0;
+			}
 		};
 
 		unsigned get_hits() const {
@@ -195,7 +269,11 @@ namespace {
 			to_cache_.insert(make_pair(origin_block, cache_block));
 			to_origin_.insert(make_pair(cache_block, origin_block));
 		}
-
+		void clear() {
+			to_cache_.clear();
+			to_origin_.clear();
+			hits_ = misses_ = evictions_ = 0;
+		}
 	private:
 		typedef map<block, block> block_map;
 
@@ -213,13 +291,15 @@ namespace {
 
 	class policy {
 	public:
-		typedef shared_ptr<policy> ptr;
+		typedef std::shared_ptr<policy> ptr;
 
-		policy(block origin_size, cache::ptr cache)
+		policy(block origin_size, cache::ptr cache, bool check)
 			: origin_size_(origin_size),
-			  cache_(cache) {
+			  cache_(cache),check_request(check) {
 		}
-
+		bool need_check_request() {
+			return check_request;
+		}
 		virtual ~policy() {}
 		virtual void map(block origin_block) = 0;
 
@@ -235,6 +315,7 @@ namespace {
 	private:
 		block origin_size_;
 		cache::ptr cache_;
+		bool check_request;
 	};
 
 	// A silly little policy that gives us a baseline to compare the
@@ -242,14 +323,15 @@ namespace {
 	// well!
 	class random_policy : public policy {
 	public:
-		random_policy(double prob_of_promotion, block origin_size, cache::ptr cache)
-			: policy(origin_size, cache),
+		random_policy(double prob_of_promotion, block origin_size, 
+				cache::ptr cache, bool check = true)
+			: policy(origin_size, cache, check),
 			  prob_(prob_of_promotion) {
 		}
 
 		virtual void map(block origin_block) {
 			double r = rand01();
-			if (r < prob_) {
+			if (r < prob_ ) {
 				cache::ptr c = get_cache();
 				c->insert(rand_block(c->size()), origin_block);
 			}
@@ -261,8 +343,9 @@ namespace {
 
 	class hash_policy : public policy {
 	public:
-		hash_policy(unsigned hash_size, double prob, block origin_size, cache::ptr cache)
-			: policy(origin_size, cache),
+		hash_policy(unsigned hash_size, double prob, block origin_size,
+				cache::ptr cache, bool check = true)
+			: policy(origin_size, cache, check),
 			  hash_(hash_size, 0),
 			  prob_(prob) {
 		}
@@ -297,8 +380,8 @@ namespace {
 
 	class lru_policy : public policy {
 	public:
-		lru_policy(block origin_size, cache::ptr cache)
-			: policy(origin_size, cache),
+		lru_policy(block origin_size, cache::ptr cache, bool check = true)
+			: policy(origin_size, cache, check),
 			  entries_(cache->size()) {
 		}
 
@@ -387,8 +470,8 @@ namespace {
 		typedef std::map<block, entry &> entry_map;
 
 	public:
-		arc_policy(block origin_size, cache::ptr cache)
-			: policy(origin_size, cache),
+		arc_policy(block origin_size, cache::ptr cache,bool check = false)
+			: policy(origin_size, cache, check),
 			  entries_(cache->size() * 2),
 			  p_(0),
 			  allocated_(0),
@@ -588,8 +671,9 @@ namespace {
 
 	class arc_window_policy : public arc_policy {
 	public:
-		arc_window_policy(block interesting_size, block origin_size, cache::ptr cache)
-			: arc_policy(origin_size, cache),
+		arc_window_policy(block interesting_size, block origin_size,
+				cache::ptr cache, bool check = false)
+			: arc_policy(origin_size, cache, check),
 			  entries_(interesting_size),
 			  allocated_(0) {
 		}
@@ -641,8 +725,9 @@ namespace {
 
 	class arc_hash_policy : public arc_policy {
 	public:
-		arc_hash_policy(block interesting_size, block origin_size, cache::ptr cache)
-			: arc_policy(origin_size, cache),
+		arc_hash_policy(block interesting_size, block origin_size,
+				cache::ptr cache, bool check = false)
+			: arc_policy(origin_size, cache, check),
 			  table_(interesting_size, 0) {
 		}
 
@@ -703,15 +788,184 @@ namespace {
 	private:
 		block begin_, end_, current_;
 	};
+	class trace_sequence : public sequence<block> {
+	public:
+		trace_sequence(char const *fname, int begin, int end)
+			: current_(0) {
+			int i = 1;
+			fstream fin(fname, ios::in);
+			if (!fin.is_open()) 
+				throw "can not open trace file";
+			while(!fin.eof()) {
+				block t;
+				fin>>t;
+				if (!fin || i >= end) break;
+				if (i >= begin)
+					trace.push_back(t);
+				i++;
+			}
+			if (i < end)
+				throw "reading file error";
+			fin.close();
+		}
+		virtual block operator() () {
+			block r = trace.at(current_);
+			if (++current_ >= trace.size())
+				current_ = 0;
+			return r;
+		}
+	private:
+		size_t current_;
+		vector<block> trace;
+	};
+	
+	class prefetcher {
+	public:
+		typedef std::shared_ptr<prefetcher> ptr;
+		prefetcher(policy::ptr p, cache::ptr c): policy_(p),cache_(c) {
+			pref_times = 0; pref_blocks = 0;
+		}
+		virtual void prefetch(block b) = 0;
+		virtual void clear() {
+			pref_blocks = 0;
+			pref_times = 0;
+		}
+		void set_policy(policy::ptr p) {
+			policy_ = p;
+		}
+		void display_stats() {
+			cout<<"prefetch times: "<<pref_times;
+			cout<<"  prefetch blocks: "<<pref_blocks<<endl;
+			clear();
+		}
 
-	//--------------------------------
+	protected:
+		policy::ptr policy_;
+		cache::ptr  cache_;
+		unsigned long pref_times;
+		unsigned long pref_blocks;
+	};
+	
+	class readahead : public prefetcher {
+	public:
+		readahead(policy::ptr p, cache::ptr c, block max_win):
+			prefetcher(p,c), max_win_(max_win), cur_win_(0) { }
+		virtual void prefetch(block b) {
+			if (cur_win_ == 0)
+				cur_win_ = 2; //initial win size
+			else {
+				if (b == last_blk+1) {
+					cur_win_ *= 2;
+					cur_win_ = min(max_win_, cur_win_);
+					pref_times++;
+					pref_blocks += cur_win_;
+				} else 
+					cur_win_ = 0;
+			}
+			last_blk = b;
+			for(block blk = b+1; blk <= b+cur_win_; blk++) {
+				bool hit;
+				hit = cache_->request(blk, true);
+				if (policy_->need_check_request() && hit)
+					continue;
+				policy_->map(blk);
+			}
+
+		}
+		virtual void clear() {
+			prefetcher::clear();
+			cur_win_ = 0;
+		}
+	private:
+		block max_win_;
+		block cur_win_;
+		block last_blk;
+	};
+	class prefetch_map : public rule_map, public prefetcher {
+	public:
+		typedef std::shared_ptr<prefetch_map> ptr;
+		prefetch_map(policy::ptr p, cache::ptr c):rule_map(), prefetcher(p, c){
+		}
+		virtual void prefetch(block b) {
+			if (win.size()< 5) {
+				win.push_back(b);
+				return;
+			}
+			win.pop_front();
+			win.push_back(b);
+			seq secc = do_predict(win);
+			if (secc.size()){
+				pref_times++;
+				pref_blocks += secc.size();
+			}
+#ifdef DEBUG
+			{
+				cerr<<"window: ";
+				for(auto it = win.begin(); it != win.end(); it++)
+					cerr<< *it<< "  ";
+				cerr<<"predicted: ";
+				if (secc.size() == 0)
+					cerr<< "none"<< endl;
+				else 
+					for(auto it = secc.begin(); it != secc.end();
+							it++)
+						cerr<< *it<< "  ";
+				cerr<<endl;
+			}
+#endif
+			for (auto it = secc.begin(); it != secc.end(); it++) {
+				bool hit;
+				hit = cache_->request(*it,true);
+				if (policy_->need_check_request() && hit)
+					continue;
+				policy_->map(*it);
+			}
+		}
+		virtual void clear() {
+			prefetcher::clear();
+			win.clear();
+		}
+	private:
+		seq do_predict(seq ante) 
+		{
+			vector<seq> candidates;
+			seq ret;
+			for(int i = 4; i>=0; i--) {
+				mk_candidate(candidates, ante, i);
+				for(auto it = candidates.begin(); it != candidates.end();
+						it++) {
+					auto mit = seq_map.find(*it);
+					if (mit != seq_map.end()) {
+#ifdef DEBUG
+						{
+							cerr<< '{';
+							for(auto _it = mit->first.begin();
+									_it != mit->first.end();
+									_it++)
+								cerr<< *_it<< "  ";
+							cerr<< "} ";
+						}
+#endif
+						ret = mit->second;
+						return ret;
+					}
+				}
+			}
+		}
+		seq win;
+	};
 
 	void
-	run_sequence(block run_length, sequence<block>::ptr seq, cache::ptr c, policy::ptr p) {
+	run_sequence(block run_length, sequence<block>::ptr seq, cache::ptr c, policy::ptr p,
+			prefetcher::ptr pm = NULL) {
 		for (unsigned i = 0; i < run_length; i++) {
 			block b = (*seq)();
-			c->request(b);
-			p->map(b);
+			bool hit;
+			hit = c->request(b);
+			if (!p->need_check_request() || !hit)
+				p->map(b);
+			if (pm)
+				pm->prefetch(b);
 		}
 	}
 
@@ -731,28 +985,30 @@ namespace {
 		run_sequence(run_length, seq2, c, p);
 	}
 
-	template <typename T>
-	double percentage(T n, T tot) {
+	template <typename T,typename T1>
+	double percentage(T1 n, T tot) {
 		return (static_cast<double>(n) / static_cast<double>(tot)) * 100.0;
 	}
 
 	void
 	display_cache_stats(string const &label, cache::ptr c) {
 		block total = c->get_hits() + c->get_misses();
-
-		cout << label << ": "
+ 
+		cout << label << ": "<< c->get_hits()<<" blocks, "
 		     << setprecision(3) << percentage(c->get_hits(), total)
-		     << "% hits, "
+		     << "% hits, "<< c->get_evictions()<<" blocks, "
 		     << setprecision(3) << percentage(c->get_evictions(), total)
 		     << "% evictions"
 		     << endl;
 	}
+
 }
 
 //----------------------------------------------------------------
 
 int main(int argc, char **argv)
 {
+	srand(time(NULL));
 	mixture::ptr blend1, blend2;
 
 	{
@@ -785,46 +1041,87 @@ int main(int argc, char **argv)
 	sequence<block>::ptr seq2(new pdf_sequence(blend2, origin_size));
 	sequence<block>::ptr lseq(new linear_sequence(0, origin_size));
 
-	{
-		cache::ptr c(new cache(cache_size));
-		policy::ptr p(new random_policy(0.01, origin_size, c));
-		run_simulation(run_length, seq1, seq2, lseq, c, p);
-		display_cache_stats("random", c);
-	}
 
 	{
+		block cache_size = 1<<8; //128M cache , one block is 512bytes
+		block origin_size = 1l<<25; //16G in bytes 
+		block run_length = 20000;
 		cache::ptr c(new cache(cache_size));
-		policy::ptr p(new hash_policy(100, 0.01, origin_size, c));
-		run_simulation(run_length, seq1, seq2, lseq, c, p);
-		display_cache_stats("hash", c);
-	}
+		policy::ptr p(new random_policy(1.0, origin_size, c));
+		sequence<block>::ptr myseq;
+		prefetch_map::ptr  pm(new prefetch_map(p, c));
+		readahead::ptr ra(new readahead(p, c, 512));
+		try {
+		myseq = sequence<block>::ptr(new trace_sequence("ker_trace",10000, 10000+run_length));
+		pm->load();
+		}catch(const char *msg) {
+			cerr<<msg<<endl;
+			exit(-1);
+		}
+		cout<<"sequence run length: "<<run_length<<endl;
+cout<<"/*===================random test================*/"<<endl;
+		run_sequence(run_length, myseq, c, p);
+		display_cache_stats("my trace random policy ",c);
+		c->clear();
 
-	{
-		cache::ptr c(new cache(cache_size));
-		policy::ptr p(new lru_policy(origin_size, c));
-		run_simulation(run_length, seq1, seq2, lseq, c, p);
-		display_cache_stats("lru", c);
-	}
+		run_sequence(run_length, myseq, c, p, pm);
+		display_cache_stats("my trace random policy with prefetch",c);
+		pm->display_stats();
+		c->clear();
 
-	{
-		cache::ptr c(new cache(cache_size));
-		policy::ptr p(new arc_policy(origin_size, c));
-		run_simulation(run_length, seq1, seq2, lseq, c, p);
-		display_cache_stats("arc", c);
-	}
+		run_sequence(run_length, myseq, c, p, ra);
+		display_cache_stats("my trace randowm policy with readahead",c);
+		ra->display_stats();
+		c->clear();
+cout<<"/*===================lru test====================*/"<<endl;
+		p = policy::ptr(new lru_policy(origin_size, c));
+		run_sequence(run_length, myseq, c, p);
+		display_cache_stats("my trace lru policy", c);
+		c->clear();
 
-	{
-		cache::ptr c(new cache(cache_size));
-		policy::ptr p(new arc_window_policy(c->size() / 2, origin_size, c));
-		run_simulation(run_length, seq1, seq2, lseq, c, p);
-		display_cache_stats("arc_window", c);
-	}
+		p = policy::ptr(new lru_policy(origin_size, c));
+		pm->set_policy(p);
+		run_sequence(run_length, myseq, c, p, pm);
+		display_cache_stats("my trace lru policy wich prefetch", c);
+		pm->display_stats();
+		c->clear();
 
-	{
-		cache::ptr c(new cache(cache_size));
-		policy::ptr p(new arc_hash_policy(c->size() / 2, origin_size, c));
-		run_simulation(run_length, seq1, seq2, lseq, c, p);
-		display_cache_stats("arc_hash", c);
+		run_sequence(run_length, myseq, c, p, ra);
+		display_cache_stats("my trace lru policy with readahead",c);
+		ra->display_stats();
+		c->clear();
+cout<<"/*===================hash test===================*/"<<endl;
+		p = policy::ptr(new hash_policy(10000, 0.01, origin_size, c));
+		run_sequence(run_length, myseq, c, p);
+		display_cache_stats("my trace hash policy", c);
+		c->clear();
+		
+		p = policy::ptr(new hash_policy(10000, 0.01, origin_size, c));
+		pm->set_policy(p);
+		run_sequence(run_length, myseq, c, p, pm);
+		display_cache_stats("my trace hash policy with prefetch", c);
+		c->clear();
+	
+		run_sequence(run_length, myseq, c, p, ra);
+		display_cache_stats("my trace hash policy with readahead",c);
+		ra->display_stats();
+		c->clear();
+cout<<"/*===================arc_hash test===============*/"<<endl;
+		p = policy::ptr(new arc_hash_policy(c->size()/2, origin_size, c));
+		run_sequence(run_length, myseq, c, p);
+		display_cache_stats("my trace arc hash policy", c);
+		c->clear();
+
+		p = policy::ptr(new arc_hash_policy(c->size()/2, origin_size, c));
+		pm->set_policy(p);
+		run_sequence(run_length, myseq, c, p, pm);
+		display_cache_stats("my trace arc hash policy with prefetch", c);
+
+		run_sequence(run_length, myseq, c, p, ra);
+		display_cache_stats("my trace arc_hash policy with readahead",c);
+		ra->display_stats();
+		c->clear();
+
 	}
 
 	return 0;
