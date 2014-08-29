@@ -9,6 +9,7 @@
 #include <map>
 #include <boost/optional.hpp>
 #include <boost/intrusive/list.hpp>
+#include <unistd.h>
 #include "sequence.h"
 
 #include <stdlib.h>
@@ -43,7 +44,8 @@ using namespace boost::archive;
 
 #define C44(array)	ASSIGN(array, 0, 1,1,1,1);
 			
-
+char *trace_file=NULL;
+char *rule_map_file=NULL;
 //----------------------------------------------------------------
 
 namespace {
@@ -1003,7 +1005,11 @@ namespace {
 	}
 
 }
-
+void show_usage(const char *prog)
+{
+	cerr<<"[usage] "<<prog<<" -t trace_file [-r rule_map_file -h -s startpoint -l run_length]"<<endl;
+	exit(-1);
+}
 //----------------------------------------------------------------
 
 int main(int argc, char **argv)
@@ -1035,25 +1041,55 @@ int main(int argc, char **argv)
 
 	block origin_size = 1000;
 	block cache_size = 50;
-	block run_length = 100000;
+	block run_length = 10000;
 
 	sequence<block>::ptr seq1(new pdf_sequence(blend1, origin_size));
 	sequence<block>::ptr seq2(new pdf_sequence(blend2, origin_size));
 	sequence<block>::ptr lseq(new linear_sequence(0, origin_size));
-
-
+	int opt;
+	int start = 0;
+	while((opt = getopt(argc, argv, "t:r:s:l:h")) != -1) {
+		switch(opt) {
+			case 't':
+				trace_file = (char *)malloc(sizeof(char)*32);
+				strncpy(trace_file, optarg, 32);
+				break;
+			case 'r':
+				rule_map_file = (char *)malloc(sizeof(char)*32);
+				strncpy(rule_map_file, optarg, 32);
+				break;
+			case 'h':
+				show_usage(argv[0]);
+				break;
+			case 's':
+				start = atoi(optarg);
+				break;
+			case 'l':
+				run_length = atoi(optarg);
+				break;
+			case '?':
+				show_usage(argv[0]);
+				break;
+		}
+	}
+	if (trace_file == NULL) {
+		cerr<<"error: not specify trace file"<<endl;
+		show_usage(argv[0]);
+	}
 	{
-		block cache_size = 1<<8; //128M cache , one block is 512bytes
+		block cache_size = 1<<18; //128M cache , one block is 512bytes
 		block origin_size = 1l<<25; //16G in bytes 
-		block run_length = 20000;
 		cache::ptr c(new cache(cache_size));
 		policy::ptr p(new random_policy(1.0, origin_size, c));
 		sequence<block>::ptr myseq;
 		prefetch_map::ptr  pm(new prefetch_map(p, c));
 		readahead::ptr ra(new readahead(p, c, 512));
 		try {
-		myseq = sequence<block>::ptr(new trace_sequence("ker_trace",10000, 10000+run_length));
-		pm->load();
+		myseq = sequence<block>::ptr(new trace_sequence(trace_file, start, start+run_length));
+		if (rule_map_file == NULL)
+			pm->load();
+		else
+			pm->load(rule_map_file);
 		}catch(const char *msg) {
 			cerr<<msg<<endl;
 			exit(-1);
