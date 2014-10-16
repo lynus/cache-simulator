@@ -154,8 +154,9 @@ public:
 			throw "load:can not open archive file";
 		boost::archive::text_iarchive ia(ifs);
 		ia>> *this;
-		for (auto it = seq_map.begin(); it != seq_map.end(); it++)
+		for (auto it = seq_map.begin(); it != seq_map.end(); it++) {
 			it->second.sort();
+		}
 	}
 	void load() {
 		std::string fname;

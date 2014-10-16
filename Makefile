@@ -8,7 +8,7 @@ CXXFLAGS=\
 	--std=c++11 \
 	-g \
 	-I $(boost_inc_path) \
-	-L $(boost_lib_path)
+	-L $(boost_lib_path) 
 .SUFFIXES: .o .cc
 
 %.o: %.cc

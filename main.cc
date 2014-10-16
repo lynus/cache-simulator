@@ -77,7 +77,7 @@ namespace {
 			int ii;
 			ii = 0;
 			seq t;
-			for (auto it = ante.begin(); it != ante.end(); it++) {
+			for (auto it = ante.begin(); ii<4; it++) {
 				if (index[j][ii]) 
 					t.push_back(*it);
 				ii++;
@@ -225,21 +225,23 @@ namespace {
 			: hits_(0),
 			  misses_(0),
 			  evictions_(0),
-			  cache_size_(size) {
-		}
+			  cache_size_(size),
+			  is_warmingup_(false)
+		{}
 
 		block size() const {
 			return cache_size_;
 		}
-
+		inline void warmup() {is_warmingup_=true;}
+		inline void cancel_warm() {is_warmingup_=false;}
 		int request(block origin_block, bool prefetch = false) {
 			if (to_cache_.count(origin_block) > 0) {
-				if (!prefetch)
+				if (!prefetch && !is_warmingup_)
 					hits_++;
 				return 1;
 			}
 			else {
-				if (!prefetch)
+				if (!prefetch &&!is_warmingup_)
 					misses_++;
 				return 0;
 			}
@@ -285,7 +287,7 @@ namespace {
 		unsigned hits_;
 		unsigned misses_;
 		unsigned evictions_;
-
+		bool is_warmingup_;
 		unsigned cache_size_;
 	};
 
@@ -948,11 +950,14 @@ namespace {
 							cerr<< "} ";
 						}
 #endif
-						ret = mit->second;
-						return ret;
+					//	ret = mit->second;
+				//		return ret;
+						for (auto sit = mit->second.begin(); sit!=mit->second.end();sit++) 
+							ret.push_back(*sit);
 					}
 				}
 			}
+			return ret;
 		}
 		seq win;
 	};
@@ -969,6 +974,12 @@ namespace {
 			if (pm)
 				pm->prefetch(b);
 		}
+	}
+	void  warmup_cache(block run_length, sequence<block>::ptr seq, cache::ptr c,policy::ptr p)
+	{
+		c->warmup();
+		run_sequence(run_length, seq, c, p);
+		c->cancel_warm();
 	}
 
 	void
@@ -1007,7 +1018,7 @@ namespace {
 }
 void show_usage(const char *prog)
 {
-	cerr<<"[usage] "<<prog<<" -t trace_file [-r rule_map_file -h -s startpoint -l run_length]"<<endl;
+	cerr<<"[usage] "<<prog<<" -t trace_file [-r rule_map_file -h -s startpoint -l run_length -c cache_shift]"<<endl;
 	exit(-1);
 }
 //----------------------------------------------------------------
@@ -1042,13 +1053,13 @@ int main(int argc, char **argv)
 	block origin_size = 1000;
 	block cache_size = 50;
 	block run_length = 10000;
-
+	int cache_shift = 14;
 	sequence<block>::ptr seq1(new pdf_sequence(blend1, origin_size));
 	sequence<block>::ptr seq2(new pdf_sequence(blend2, origin_size));
 	sequence<block>::ptr lseq(new linear_sequence(0, origin_size));
 	int opt;
 	int start = 0;
-	while((opt = getopt(argc, argv, "t:r:s:l:h")) != -1) {
+	while((opt = getopt(argc, argv, "t:r:s:l:hc:")) != -1) {
 		switch(opt) {
 			case 't':
 				trace_file = (char *)malloc(sizeof(char)*32);
@@ -1067,6 +1078,9 @@ int main(int argc, char **argv)
 			case 'l':
 				run_length = atoi(optarg);
 				break;
+			case 'c':
+				cache_shift = atoi(optarg);
+				break;
 			case '?':
 				show_usage(argv[0]);
 				break;
@@ -1077,14 +1091,16 @@ int main(int argc, char **argv)
 		show_usage(argv[0]);
 	}
 	{
-		block cache_size = 1<<18; //128M cache , one block is 512bytes
-		block origin_size = 1l<<25; //16G in bytes 
+		block cache_size = 1<<cache_shift; //128M cache , one block is 512bytes
+		block origin_size = 1l<<31; //16G in bytes 
 		cache::ptr c(new cache(cache_size));
 		policy::ptr p(new random_policy(1.0, origin_size, c));
-		sequence<block>::ptr myseq;
+		sequence<block>::ptr warmseq, myseq;
 		prefetch_map::ptr  pm(new prefetch_map(p, c));
 		readahead::ptr ra(new readahead(p, c, 512));
 		try {
+		warmseq = sequence<block>::ptr(new trace_sequence(trace_file, start, start+run_length));
+		// myseq = sequence<block>::ptr(new trace_sequence(trace_file, start+run_length+1, start+1+run_length*2));
 		myseq = sequence<block>::ptr(new trace_sequence(trace_file, start, start+run_length));
 		if (rule_map_file == NULL)
 			pm->load();
@@ -1094,27 +1110,32 @@ int main(int argc, char **argv)
 			cerr<<msg<<endl;
 			exit(-1);
 		}
-		cout<<"sequence run length: "<<run_length<<endl;
+		cout<<trace_file<<"  sequence run length: "<<run_length<<endl;
 cout<<"/*===================random test================*/"<<endl;
+		 //warmup_cache(run_length, warmseq, c, p);
 		run_sequence(run_length, myseq, c, p);
 		display_cache_stats("my trace random policy ",c);
 		c->clear();
-
+		
+		 //warmup_cache(run_length, warmseq,c,p);
 		run_sequence(run_length, myseq, c, p, pm);
 		display_cache_stats("my trace random policy with prefetch",c);
 		pm->display_stats();
 		c->clear();
 
+		 //warmup_cache(run_length, warmseq,c,p);
 		run_sequence(run_length, myseq, c, p, ra);
 		display_cache_stats("my trace randowm policy with readahead",c);
 		ra->display_stats();
 		c->clear();
 cout<<"/*===================lru test====================*/"<<endl;
 		p = policy::ptr(new lru_policy(origin_size, c));
+		 //warmup_cache(run_length, warmseq,c,p);
 		run_sequence(run_length, myseq, c, p);
 		display_cache_stats("my trace lru policy", c);
 		c->clear();
 
+		 //warmup_cache(run_length, warmseq,c,p);
 		p = policy::ptr(new lru_policy(origin_size, c));
 		pm->set_policy(p);
 		run_sequence(run_length, myseq, c, p, pm);
@@ -1122,22 +1143,26 @@ cout<<"/*===================lru test====================*/"<<endl;
 		pm->display_stats();
 		c->clear();
 
+		 //warmup_cache(run_length, warmseq,c,p);
 		run_sequence(run_length, myseq, c, p, ra);
 		display_cache_stats("my trace lru policy with readahead",c);
 		ra->display_stats();
 		c->clear();
 cout<<"/*===================hash test===================*/"<<endl;
 		p = policy::ptr(new hash_policy(10000, 0.01, origin_size, c));
+		 //warmup_cache(run_length, warmseq,c,p);
 		run_sequence(run_length, myseq, c, p);
 		display_cache_stats("my trace hash policy", c);
 		c->clear();
 		
+		 //warmup_cache(run_length, warmseq,c,p);
 		p = policy::ptr(new hash_policy(10000, 0.01, origin_size, c));
 		pm->set_policy(p);
 		run_sequence(run_length, myseq, c, p, pm);
 		display_cache_stats("my trace hash policy with prefetch", c);
 		c->clear();
 	
+		 //warmup_cache(run_length, warmseq,c,p);
 		run_sequence(run_length, myseq, c, p, ra);
 		display_cache_stats("my trace hash policy with readahead",c);
 		ra->display_stats();
